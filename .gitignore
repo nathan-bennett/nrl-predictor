@@ -1,0 +1,22 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.env
+venv/
+.venv/
+
+# Large model files (not needed by the app)
+models/
+
+# Raw data files not needed for the app
+data/draw_2026.csv
+data/live_odds.csv
+data/model_selection_results.csv
+data/nrl_features.csv
+data/nrl_raw.xlsx
+data/predictions.csv
+data/plots/
+
+# SQLite WAL files
+data/*.db-shm
+data/*.db-wal
