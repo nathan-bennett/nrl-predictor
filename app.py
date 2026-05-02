@@ -145,8 +145,8 @@ def load_finals(_conn) -> pd.DataFrame:
             WHERE  simulated_at = ? AND model_version = 'no_odds'
             ORDER  BY
                 CASE round_name
-                    WHEN 'Qualifying Final 1 (1v2)' THEN 1
-                    WHEN 'Qualifying Final 2 (3v4)' THEN 2
+                    WHEN 'Qualifying Final 1 (1v4)' THEN 1
+                    WHEN 'Qualifying Final 2 (2v3)' THEN 2
                     WHEN 'Elimination Final 1 (5v8)' THEN 3
                     WHEN 'Elimination Final 2 (6v7)' THEN 4
                     WHEN 'Semi Final 1' THEN 5
@@ -208,6 +208,67 @@ def load_team_form() -> pd.DataFrame:
     return pd.DataFrame(rows).sort_values("ELO", ascending=False).reset_index(drop=True)
 
 
+@st.cache_data(ttl=600)
+def load_monte_carlo(_conn):
+    """Return (pivot_df, n_sims) from the most recent Monte Carlo run."""
+    try:
+        latest = pd.read_sql("""
+            SELECT simulated_at, n_sims FROM monte_carlo_positions
+            ORDER BY simulated_at DESC LIMIT 1
+        """, conn)
+        if latest.empty:
+            return pd.DataFrame(), 0
+        ts     = latest.iloc[0]["simulated_at"]
+        n_sims = int(latest.iloc[0]["n_sims"])
+        df = pd.read_sql("""
+            SELECT team, position, count
+            FROM monte_carlo_positions
+            WHERE simulated_at = ?
+            ORDER BY team, position
+        """, conn, params=(ts,))
+        return df, n_sims
+    except Exception:
+        return pd.DataFrame(), 0
+
+
+@st.cache_data(ttl=1800)
+def compute_elo_history(_conn) -> pd.DataFrame:
+    """Compute per-team ELO trajectory from 2026 completed fixtures."""
+    try:
+        games = pd.read_sql("""
+            SELECT date, home_team, away_team,
+                   actual_home_score, actual_away_score
+            FROM   fixtures
+            WHERE  season = 2026 AND is_completed = 1
+              AND  actual_home_score IS NOT NULL
+            ORDER  BY date ASC
+        """, conn, parse_dates=["date"])
+        if games.empty:
+            return pd.DataFrame()
+
+        all_teams = sorted(set(games["home_team"]) | set(games["away_team"]))
+        elo = {t: 1500.0 for t in all_teams}
+        K, HOME_ADV = 25, 50
+
+        # Start point before Round 1
+        pre_date = games.iloc[0]["date"] - pd.Timedelta(days=7)
+        records = [{"date": pre_date, "Team": t, "ELO": 1500.0} for t in all_teams]
+
+        for _, g in games.iterrows():
+            h, a   = g["home_team"], g["away_team"]
+            h_elo, a_elo = elo[h], elo[a]
+            h_exp  = 1 / (1 + 10 ** ((a_elo - h_elo - HOME_ADV) / 400))
+            h_act  = 1.0 if g["actual_home_score"] > g["actual_away_score"] else 0.0
+            elo[h] = h_elo + K * (h_act - h_exp)
+            elo[a] = a_elo + K * ((1 - h_act) - (1 - h_exp))
+            records.append({"date": g["date"], "Team": h, "ELO": round(elo[h], 1)})
+            records.append({"date": g["date"], "Team": a, "ELO": round(elo[a], 1)})
+
+        return pd.DataFrame(records)
+    except Exception:
+        return pd.DataFrame()
+
+
 def confidence_colour(conf: float) -> str:
     if conf >= 70:
         return "#1a7a1a"
@@ -233,8 +294,12 @@ with st.sidebar:
     st.caption("Stack v2 model · 55.8% test accuracy")
     st.divider()
 
-    page = st.radio("View", ["Predictions", "Results Tracker", "Team Form",
-                              "Ladder Predictor", "Finals Predictor"])
+    page = st.radio("View", [
+        "Predictions", "Value Bets",
+        "Results Tracker", "Team Form",
+        "Ladder Predictor", "Monte Carlo",
+        "Finals Predictor", "ELO Tracker",
+    ])
 
     st.divider()
     if st.button("🔄 Refresh data", use_container_width=True):
@@ -608,3 +673,186 @@ elif page == "Finals Predictor":
                         unsafe_allow_html=True,
                     )
                 st.divider()
+
+
+# =============================================================================
+#  PAGE 6 — VALUE BETS
+# =============================================================================
+
+elif page == "Value Bets":
+    st.title("Value Bet Finder")
+    st.caption(
+        "Games where the model's win probability meaningfully exceeds the bookmaker's implied probability.  "
+        "Positive edge = model thinks team is underpriced."
+    )
+
+    upcoming = df_preds[~df_preds["is_completed"].astype(bool)].copy()
+    upcoming_odds = upcoming[upcoming["home_odds"].notna() & upcoming["away_odds"].notna()].copy()
+
+    if upcoming_odds.empty:
+        st.info("No upcoming fixtures with odds data. Run `python3 08_update_db.py` to fetch current odds.")
+    else:
+        imp_h = 1 / upcoming_odds["home_odds"]
+        imp_a = 1 / upcoming_odds["away_odds"]
+        total = imp_h + imp_a
+        upcoming_odds["implied_home"] = imp_h / total
+        upcoming_odds["implied_away"] = imp_a / total
+        upcoming_odds["model_home"] = upcoming_odds["home_win_prob"] / 100
+        upcoming_odds["model_away"] = upcoming_odds["away_win_prob"] / 100
+        upcoming_odds["home_edge"] = (upcoming_odds["model_home"] - upcoming_odds["implied_home"]) * 100
+        upcoming_odds["away_edge"] = (upcoming_odds["model_away"] - upcoming_odds["implied_away"]) * 100
+        upcoming_odds["value_team"]  = upcoming_odds.apply(
+            lambda r: r["home_team"] if r["home_edge"] >= r["away_edge"] else r["away_team"], axis=1)
+        upcoming_odds["edge"]        = upcoming_odds[["home_edge", "away_edge"]].max(axis=1)
+        upcoming_odds["value_odds"]  = upcoming_odds.apply(
+            lambda r: r["home_odds"] if r["home_edge"] >= r["away_edge"] else r["away_odds"], axis=1)
+        upcoming_odds["model_prob"]  = upcoming_odds.apply(
+            lambda r: r["model_home"] if r["home_edge"] >= r["away_edge"] else r["model_away"], axis=1)
+        upcoming_odds["market_prob"] = upcoming_odds.apply(
+            lambda r: r["implied_home"] if r["home_edge"] >= r["away_edge"] else r["implied_away"], axis=1)
+        upcoming_odds = upcoming_odds.sort_values("edge", ascending=False)
+
+        positive = upcoming_odds[upcoming_odds["edge"] > 0]
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Games with odds", len(upcoming_odds))
+        c2.metric("Positive value bets", len(positive))
+        c3.metric("Avg edge (positive)", f"{positive['edge'].mean():.1f}%" if len(positive) else "—")
+        st.divider()
+
+        for _, row in upcoming_odds.iterrows():
+            edge  = row["edge"]
+            model = row["model_prob"] * 100
+            mkt   = row["market_prob"] * 100
+            team  = row["value_team"]
+            odds  = row["value_odds"]
+            match = f"{row['home_team']} vs {row['away_team']}"
+            if edge >= 5:
+                border, label = "#1a7a1a", "Strong value"
+            elif edge >= 2:
+                border, label = "#4a8f1a", "Value"
+            elif edge > 0:
+                border, label = "#8f8f00", "Slight value"
+            else:
+                border, label = "#8f4a00", "No value"
+
+            c1, c2, c3 = st.columns([3, 2, 2])
+            with c1:
+                date_str = row["date"].strftime("%-d %b") if hasattr(row["date"], "strftime") else str(row["date"])[:10]
+                st.markdown(f"**{match}**  \n📅 {date_str}")
+            with c2:
+                st.metric(label="Value team / odds", value=team, delta=f"@ {odds:.2f}")
+            with c3:
+                st.markdown(
+                    f"<div style='border-left:4px solid {border};padding:8px 12px;"
+                    f"border-radius:4px'><b>{label}</b> — edge: <b>{edge:+.1f}%</b><br>"
+                    f"<small>Model {model:.0f}% vs Market {mkt:.0f}%</small></div>",
+                    unsafe_allow_html=True,
+                )
+            st.divider()
+
+
+# =============================================================================
+#  PAGE 7 — MONTE CARLO
+# =============================================================================
+
+elif page == "Monte Carlo":
+    st.title("Monte Carlo Ladder Simulation")
+    st.caption(
+        "Each cell shows the % of simulations where that team finished in that position. "
+        "Darker = more likely.  Run `python3 11_simulate_season.py` to refresh."
+    )
+
+    mc_df, n_sims = load_monte_carlo(conn)
+
+    if mc_df.empty:
+        st.info(
+            "No Monte Carlo data found.  \n"
+            "Run `python3 11_simulate_season.py` (Monte Carlo runs automatically after the main simulation)."
+        )
+    else:
+        st.caption(f"Based on {n_sims} simulations.")
+
+        pivot = mc_df.pivot(index="team", columns="position", values="count").fillna(0)
+        pivot = pivot.div(n_sims) * 100
+        for p in range(1, 17):
+            if p not in pivot.columns:
+                pivot[p] = 0.0
+        pivot = pivot[[c for c in sorted(pivot.columns) if c <= 16]]
+        expected = (pivot * pivot.columns).sum(axis=1) / 100
+        pivot = pivot.loc[expected.sort_values().index]
+        pivot.columns = [f"P{c}" for c in pivot.columns]
+        pivot.index.name = "Team"
+
+        st.dataframe(
+            pivot.style.background_gradient(cmap="YlGn", axis=0, vmin=0).format("{:.0f}%"),
+            use_container_width=True,
+        )
+        st.divider()
+
+        finals_prob   = mc_df[mc_df["position"] <= 8].groupby("team")["count"].sum() / n_sims * 100
+        top4_prob     = mc_df[mc_df["position"] <= 4].groupby("team")["count"].sum() / n_sims * 100
+        premiers_prob = mc_df[mc_df["position"] == 1].groupby("team")["count"].sum() / n_sims * 100
+        summary = pd.DataFrame({
+            "Finals %":   finals_prob,
+            "Top 4 %":    top4_prob,
+            "Premiers %": premiers_prob,
+        }).fillna(0).sort_values("Finals %", ascending=False)
+
+        st.subheader("Probability Summary")
+        st.dataframe(
+            summary.style.background_gradient(cmap="Blues", axis=0).format("{:.0f}%"),
+            use_container_width=True,
+        )
+
+
+# =============================================================================
+#  PAGE 8 — ELO TRACKER
+# =============================================================================
+
+elif page == "ELO Tracker":
+    st.title("2026 ELO Ratings Over Time")
+    st.caption(
+        "ELO computed from 2026 completed results (all teams start at 1500). "
+        "Shows relative momentum — which teams are trending up or down."
+    )
+
+    elo_df = compute_elo_history(conn)
+
+    if elo_df.empty:
+        st.info("No completed 2026 results in DB yet. Run `python3 10_fetch_draw_2026.py` to import results.")
+    else:
+        all_teams = sorted(elo_df["Team"].unique())
+        selected  = st.multiselect("Filter teams (leave blank to show all)", options=all_teams, default=[])
+        plot_teams = selected if selected else all_teams
+        plot_df   = elo_df[elo_df["Team"].isin(plot_teams)].copy()
+        wide      = plot_df.pivot_table(index="date", columns="Team", values="ELO", aggfunc="last")
+        wide      = wide.sort_index().ffill()
+
+        st.line_chart(wide, use_container_width=True)
+        st.divider()
+
+        latest_elo = (
+            elo_df[elo_df["Team"].isin(plot_teams)]
+            .sort_values("date")
+            .groupby("Team")["ELO"]
+            .last()
+            .reset_index()
+            .rename(columns={"ELO": "Current ELO"})
+            .sort_values("Current ELO", ascending=False)
+            .reset_index(drop=True)
+        )
+        latest_elo.index += 1
+
+        def style_elo_cell(val):
+            if isinstance(val, (int, float)):
+                if val > 1530:
+                    return "background-color:#d4edda;color:#155724"
+                if val < 1470:
+                    return "background-color:#f8d7da;color:#721c24"
+            return ""
+
+        st.subheader("Current ELO Rankings")
+        st.dataframe(
+            latest_elo.style.map(style_elo_cell, subset=["Current ELO"]),
+            use_container_width=True,
+        )
