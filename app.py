@@ -3,6 +3,7 @@ NRL Predictor — Streamlit dashboard
 
 Run:  streamlit run app.py
 """
+# deploy: 2026-05-21
 
 import sqlite3
 from pathlib import Path
