@@ -3,7 +3,7 @@ NRL Predictor — Streamlit dashboard
 
 Run:  streamlit run app.py
 """
-# deploy: 2026-05-21
+# deploy: 2026-05-21-02
 
 import sqlite3
 from pathlib import Path
@@ -22,6 +22,16 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+# Invalidate cached connection + query results whenever the DB file changes on
+# disk. Streamlit Cloud hot-reloads the script but keeps `@st.cache_resource`
+# objects alive — without this, the cached SQLite connection keeps serving the
+# pre-redeploy file contents.
+_db_mtime = DB_PATH.stat().st_mtime if DB_PATH.exists() else 0
+if st.session_state.get("_db_mtime") != _db_mtime:
+    st.cache_data.clear()
+    st.cache_resource.clear()
+    st.session_state["_db_mtime"] = _db_mtime
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -305,6 +315,7 @@ with st.sidebar:
     st.divider()
     if st.button("🔄 Refresh data", use_container_width=True):
         st.cache_data.clear()
+        st.cache_resource.clear()
         st.rerun()
 
     conn = get_conn()
