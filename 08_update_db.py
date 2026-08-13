@@ -143,6 +143,16 @@ def init_db():
 
 # ── Scraping ──────────────────────────────────────────────────────────────────
 
+# OddsPortal moved to Tailwind utility classes in 2026 — the old semantic class
+# names (div.group, p.participant-name) are gone. data-testid is the stable hook.
+ROW_SEL    = "div[data-testid=game-row]"
+NAME_SEL   = "p[data-testid=participant-name]"
+ODDS_SEL   = "p[data-testid^=odd-container]"
+HOST_SEL   = "div[data-testid=game-host]"
+GUEST_SEL  = "div[data-testid=game-guest]"
+DATEHDR_SEL = "div[data-testid=date-header]"
+
+
 def scrape_oddsportal(url: str) -> str:
     """Fetch OddsPortal page HTML using Playwright."""
     import random
@@ -159,12 +169,13 @@ def scrape_oddsportal(url: str) -> str:
             viewport={"width": 1280, "height": 900},
         )
         page = ctx.new_page()
-        page.goto(url, wait_until="domcontentloaded", timeout=30000)
-        time.sleep(random.uniform(3, 5))
+        page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        # Rows are client-rendered — wait for them before snapshotting the DOM.
         try:
-            page.wait_for_selector("p.participant-name", timeout=12000)
+            page.wait_for_selector(ROW_SEL, timeout=30000)
         except PWT:
             pass
+        time.sleep(random.uniform(3, 5))
         html = page.content()
         browser.close()
     return html
@@ -223,12 +234,12 @@ def parse_fixtures_from_html(html: str) -> list[dict]:
         except Exception:
             continue
 
-    # Odds from div.group rows
+    # Odds from match rows. The market is 3-way (home / draw / away), so the
+    # first and last containers are the ones we want.
     fixtures = []
     seen = set()
-    for row in soup.find_all("div", class_="group"):
-        names = [p.get_text(strip=True)
-                 for p in row.find_all("p", class_="participant-name")]
+    for row in soup.select(ROW_SEL):
+        names = [p.get_text(strip=True) for p in row.select(NAME_SEL)]
         if len(names) != 2:
             continue
         key = tuple(names)
@@ -236,10 +247,10 @@ def parse_fixtures_from_html(html: str) -> list[dict]:
             continue
         seen.add(key)
 
-        text  = row.get_text(" ", strip=True)
-        odds  = re.findall(r'\b([1-9]\d{0,2}\.\d{2})\b', text)
-        h_odd = float(odds[0])  if len(odds) > 0 else None
-        a_odd = float(odds[-1]) if len(odds) > 1 else None
+        odds  = [_to_float(p.get_text(strip=True)) for p in row.select(ODDS_SEL)]
+        odds  = [o for o in odds if o is not None]
+        h_odd = odds[0]  if len(odds) > 0 else None
+        a_odd = odds[-1] if len(odds) > 1 else None
         m     = meta.get(key) or meta.get((names[1], names[0])) or {}
 
         fixtures.append({
@@ -253,6 +264,55 @@ def parse_fixtures_from_html(html: str) -> list[dict]:
     return fixtures
 
 
+def _to_float(text: str):
+    try:
+        return float(text)
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_date_header(text: str) -> str:
+    """
+    'Today, 13 Aug' / 'Tomorrow, 14 Aug' / '09 Aug 2026' → ISO 'YYYY-MM-DD'.
+    Relative headers carry no year, so fall back to the current one.
+    """
+    from datetime import datetime, timedelta
+
+    today = datetime.now()
+    low   = text.lower()
+    if low.startswith("today"):
+        return today.strftime("%Y-%m-%d")
+    if low.startswith("tomorrow"):
+        return (today + timedelta(days=1)).strftime("%Y-%m-%d")
+    if low.startswith("yesterday"):
+        return (today - timedelta(days=1)).strftime("%Y-%m-%d")
+
+    m = re.search(r'(\d{1,2})\s+([A-Za-z]{3})[a-z]*\s*(\d{4})?', text)
+    if not m:
+        return ""
+    day, mon, year = m.group(1), m.group(2), m.group(3) or str(today.year)
+    try:
+        return datetime.strptime(f"{day} {mon} {year}", "%d %b %Y").strftime("%Y-%m-%d")
+    except ValueError:
+        return ""
+
+
+def _row_score(cell, name: str):
+    """
+    Score sits a couple of levels above the team-name cell. Walk up until a bare
+    number turns up, stopping at event-participants — that node holds both teams'
+    scores and would give the wrong one.
+    """
+    node = cell
+    while node is not None and node.get("data-testid") != "event-participants":
+        rest = node.get_text(" ", strip=True).replace(name, " ")
+        m = re.search(r'\b(\d{1,3})\b', rest)
+        if m:
+            return int(m.group(1))
+        node = node.parent
+    return None
+
+
 def parse_results_from_html(html: str) -> list[dict]:
     """Extract completed game scores from OddsPortal results page."""
     from bs4 import BeautifulSoup
@@ -260,36 +320,37 @@ def parse_results_from_html(html: str) -> list[dict]:
     soup = BeautifulSoup(html, "lxml")
     results = []
     seen = set()
+    current_date = ""
 
-    for script in soup.find_all("script", type="application/ld+json"):
-        try:
-            d = json.loads(script.string or "")
-            if "SportsEvent" not in (d.get("@type") or []):
-                continue
-            desc  = d.get("description", "")
-            name  = d.get("name", "")
-            parts = name.split(" - ", 1)
-            if len(parts) != 2:
-                continue
-            home_raw, away_raw = parts[0].strip(), parts[1].strip()
-            key = (home_raw, away_raw)
-            if key in seen:
-                continue
-            seen.add(key)
-
-            # Score sometimes in description: "Team A - Team B 24 - 18 ..."
-            score_m = re.search(r'\b(\d+)\s*[-–]\s*(\d+)\b', desc)
-            if not score_m:
-                continue
-            results.append({
-                "home_team":  norm(home_raw),
-                "away_team":  norm(away_raw),
-                "date":       (d.get("startDate") or "")[:10],
-                "home_score": int(score_m.group(1)),
-                "away_score": int(score_m.group(2)),
-            })
-        except Exception:
+    # Date headers precede the rows they apply to, so walk both in document order.
+    for el in soup.select(f"{DATEHDR_SEL}, {ROW_SEL}"):
+        if el.get("data-testid") == "date-header":
+            current_date = _parse_date_header(el.get_text(" ", strip=True))
             continue
+
+        names = [p.get_text(strip=True) for p in el.select(NAME_SEL)]
+        if len(names) != 2:
+            continue
+        key = tuple(names)
+        if key in seen:
+            continue
+
+        host  = el.select_one(HOST_SEL)
+        guest = el.select_one(GUEST_SEL)
+        # The score lives one level up from the name cell, next to it.
+        h_score = _row_score(host, names[0])
+        a_score = _row_score(guest, names[1])
+        if h_score is None or a_score is None:
+            continue
+
+        seen.add(key)
+        results.append({
+            "home_team":  norm(names[0]),
+            "away_team":  norm(names[1]),
+            "date":       current_date,
+            "home_score": h_score,
+            "away_score": a_score,
+        })
     return results
 
 

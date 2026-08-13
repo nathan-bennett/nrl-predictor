@@ -158,10 +158,14 @@ def parse_api_draw(api_data: list) -> list[dict]:
     fixtures = []
     for data in api_data:
         # NRL API v3 format: {"fixtures": [...]} or {"draw": [...]}
-        items = (data.get("fixtures") or data.get("draw") or
-                 data.get("matches") or [])
-        if not items and isinstance(data, list):
+        # Some endpoints return a bare list, so check that before .get().
+        if isinstance(data, list):
             items = data
+        elif isinstance(data, dict):
+            items = (data.get("fixtures") or data.get("draw") or
+                     data.get("matches") or [])
+        else:
+            continue
 
         for item in items:
             if not isinstance(item, dict):
